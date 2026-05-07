@@ -1,0 +1,46 @@
+/target/
+/target-*/
+**/target/
+**/target-*/
+
+# Rust build outputs and local cargo state
+*.rlib
+*.rmeta
+*.pdb
+*.ilk
+*.exp
+*.lib
+.cargo/
+
+# WDK/package outputs
+*.sys
+*.inf
+*.cat
+*.pdb
+*.cer
+*.pvk
+*.pfx
+
+# Generated benchmark and analysis outputs
+/artifacts/
+benches/bin/
+*.csv
+*.svg
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.log
+*~
+_*
+.tmp*
+
+# Editor and OS files
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+Thumbs.db
+Desktop.ini

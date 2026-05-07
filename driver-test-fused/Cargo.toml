@@ -1,0 +1,30 @@
+[package]
+name = "driver-test-fused"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[dependencies]
+kcom = { path = "..", default-features = false, features = ["driver", "async-com-kernel", "async-com-fused"] }
+kcom-tests = { path = "../kcom-tests", default-features = false }
+wdk-sys = { version = "*", default-features = false }
+
+[features]
+default = ["bench-async-com", "bench-scenario-yield1", "async-com-fused"]
+bench-async-com = ["kcom-tests/bench-async-com"]
+async-com-metrics = ["kcom/async-com-metrics", "kcom-tests/async-com-metrics"]
+bench-scenario-immediate = ["kcom-tests/bench-scenario-immediate"]
+bench-scenario-yield1 = ["kcom-tests/bench-scenario-yield1"]
+bench-scenario-yieldN = ["kcom-tests/bench-scenario-yieldN"]
+bench-iter-small = ["kcom-tests/bench-iter-small"]
+bench-iter-medium = ["kcom-tests/bench-iter-medium"]
+bench-iter-large = ["kcom-tests/bench-iter-large"]
+bench-par-1 = ["kcom-tests/bench-par-1"]
+bench-par-4 = ["kcom-tests/bench-par-4"]
+bench-par-16 = ["kcom-tests/bench-par-16"]
+async-com-fused = ["kcom-tests/async-com-fused", "kcom/async-com-fused"]
+feature-mdl = []
+mdl-replace = ["feature-mdl"]
+
+[lib]
+crate-type = ["cdylib"]

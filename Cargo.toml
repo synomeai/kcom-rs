@@ -1,0 +1,78 @@
+[package]
+name = "kcom"
+version = "0.5.0"
+edition = "2021"
+autotests = false
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "Zero-copy COM runtime for Windows kernel drivers in Rust."
+repository = "https://github.com/exveria1015/kcom-rs"
+homepage = "https://github.com/exveria1015/kcom-rs"
+documentation = "https://docs.rs/kcom"
+keywords = ["com", "windows", "kernel", "wdk", "no_std"]
+categories = ["os::windows-apis", "no-std"]
+
+[dependencies]
+paste = "1"
+async-trait = { version = "0.1", optional = true }
+utf16_lit = { version = "2", optional = true }
+wdk-sys = { version = "*", optional = true, default-features = false }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+default = []
+async-com = []
+async-com-metrics = []
+async-impl = ["async-com", "async-trait"]
+async-com-kernel = ["async-com", "wdk-sys"]
+async-com-fused = ["async-com-kernel"]
+kernel-unicode = ["utf16_lit"]
+driver = ["wdk-sys"]
+driver-test-stub = ["driver"]
+refcount-hardening = []
+leaky-hardening = ["refcount-hardening"]
+wdk-alloc-align = ["driver"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(driver_model__driver_type, values("WDM", "KMDF"))'] }
+
+[package.metadata.docs.rs]
+features = ["async-impl", "kernel-unicode"]
+
+[[example]]
+name = "declare_com_interface_async"
+required-features = ["async-com"]
+
+[[example]]
+name = "spawn_task_host"
+
+[[example]]
+name = "kernel_timer_future_driver"
+required-features = ["driver", "async-com-kernel"]
+
+[[example]]
+name = "work_item_task_driver"
+required-features = ["driver", "async-com-kernel"]
+
+[[bench]]
+name = "async_benchmark"
+harness = false
+required-features = ["async-com"]
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[[bench]]
+name = "comparison_async"
+harness = false
+required-features = ["async-com"]
+
+[workspace]
+members = [".", "driver-test", "driver-test-fused", "kcom-tests", "tokio-bench", "io-bench"]
+resolver = "2"
+
+[profile.release]
+panic = "abort"

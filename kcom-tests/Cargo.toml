@@ -1,0 +1,31 @@
+[package]
+name = "kcom-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+kcom = { path = "..", default-features = false }
+
+[features]
+default = []
+async-com = ["kcom/async-com"]
+async-com-metrics = ["kcom/async-com-metrics"]
+async-com-kernel = ["kcom/async-com-kernel"]
+async-com-fused = ["kcom/async-com-fused"]
+async-impl = ["kcom/async-impl"]
+kernel-unicode = ["kcom/kernel-unicode"]
+driver = ["kcom/driver"]
+driver-test-stub = ["kcom/driver-test-stub"]
+refcount-hardening = ["kcom/refcount-hardening"]
+wdk-alloc-align = ["kcom/wdk-alloc-align"]
+bench-async-com = ["driver", "async-com-kernel"]
+bench-scenario-immediate = []
+bench-scenario-yield1 = []
+bench-scenario-yieldN = []
+bench-iter-small = []
+bench-iter-medium = []
+bench-iter-large = []
+bench-par-1 = []
+bench-par-4 = []
+bench-par-16 = []
