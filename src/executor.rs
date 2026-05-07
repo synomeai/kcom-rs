@@ -4,13 +4,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core::future::Future;
-#[cfg(any(not(feature = "driver"), feature = "async-com-kernel", miri))]
 use core::pin::Pin;
-#[cfg(any(not(feature = "driver"), feature = "async-com-kernel", miri))]
 use core::task::{Context, Poll};
-#[cfg(any(not(feature = "driver"), miri))]
+#[cfg(any(not(all(feature = "driver", feature = "async-com-kernel")), miri))]
 use core::cell::{Cell, RefCell};
-#[cfg(any(not(feature = "driver"), miri))]
+#[cfg(any(not(all(feature = "driver", feature = "async-com-kernel")), miri))]
 use crate::alloc::boxed::Box;
 
 use crate::iunknown::{NTSTATUS, STATUS_NOT_SUPPORTED};
@@ -1964,4 +1962,3 @@ where
         Poll::Pending => STATUS_SUCCESS,
     }
 }
-
