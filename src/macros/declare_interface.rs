@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Exveria
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-
 #[macro_export]
 /// Declares a COM interface trait and generates its vtable definition.
 ///
@@ -80,6 +79,7 @@ macro_rules! __kcom_define_interface {
             trait_methods [],
             vtable_fields [],
             vtable_inits [],
+            vtable_inits_primary [],
             vtable_inits_secondary [],
             shim_funcs [],
             ;
@@ -100,6 +100,7 @@ macro_rules! __kcom_define_interface {
         trait_methods [$($trait_methods:tt)*],
         vtable_fields [$($vtable_fields:tt)*],
         vtable_inits [$($vtable_inits:tt)*],
+        vtable_inits_primary [$($vtable_inits_primary:tt)*],
         vtable_inits_secondary [$($vtable_inits_secondary:tt)*],
         shim_funcs [$($shim_funcs:tt)*],
         ;
@@ -144,7 +145,7 @@ macro_rules! __kcom_define_interface {
                     $trait_name,
                     [<$trait_name Vtbl>],
                     $($parent_vtable)+,
-                    { $($vtable_inits)* }
+                    { $($vtable_inits_primary)* }
                 );
 
                 $crate::__kcom_vtbl_impl_secondary!(
@@ -241,6 +242,7 @@ macro_rules! __kcom_define_interface {
         trait_methods [$($trait_methods:tt)*],
         vtable_fields [$($vtable_fields:tt)*],
         vtable_inits [$($vtable_inits:tt)*],
+        vtable_inits_primary [$($vtable_inits_primary:tt)*],
         vtable_inits_secondary [$($vtable_inits_secondary:tt)*],
         shim_funcs [$($shim_funcs:tt)*],
         ;
@@ -291,6 +293,11 @@ macro_rules! __kcom_define_interface {
                 $($vtable_inits)*
                 #[cfg(feature = "async-com")]
                 $method_name: [<shim_ $trait_name _ $method_name>]::<T>,
+            ],
+            vtable_inits_primary [
+                $($vtable_inits_primary)*
+                #[cfg(feature = "async-com")]
+                $method_name: [<shim_ $trait_name _ $method_name _primary>]::<T, P, S, A>,
             ],
             vtable_inits_secondary [
                 $($vtable_inits_secondary)*
@@ -348,6 +355,93 @@ macro_rules! __kcom_define_interface {
                             Err(err) => {
                                 unsafe {
                                     $crate::wrapper::ComObject::<T, [<$trait_name Vtbl>]>::shim_release(this);
+                                }
+                                let status: $crate::NTSTATUS = err.into();
+                                return match $crate::async_com::spawn_async_operation_error_raw::<
+                                    $ret_ty,
+                                    <T as $trait_name>::[<$method_name:camel Future>],
+                                >(status) {
+                                    Ok(ptr) => ptr,
+                                    Err(_status) => core::ptr::null_mut(),
+                                };
+                            }
+                        };
+                        let op = $crate::async_com::spawn_async_operation_raw::<$ret_ty, _>(async move {
+                            struct ReleaseGuard {
+                                ptr: $crate::GuardPtr,
+                                release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+                            }
+                            impl Drop for ReleaseGuard {
+                                fn drop(&mut self) {
+                                    unsafe { (self.release)(self.ptr.as_ptr()) };
+                                }
+                            }
+                            let _guard = ReleaseGuard {
+                                ptr: guard_ptr,
+                                release: release_fn,
+                            };
+                            future.as_mut().await
+                        });
+                        match op {
+                            Ok(ptr) => ptr,
+                            Err(_status) => {
+                                unsafe { (release_fn)(this) };
+                                core::ptr::null_mut()
+                            }
+                        }
+                    }
+                }
+                #[allow(non_snake_case)]
+                #[allow(dead_code)]
+                pub unsafe extern "system" fn [<shim_ $trait_name _ $method_name _primary>]<T, P, S, A>(
+                    this: *mut core::ffi::c_void
+                    $(, $arg_name: $arg_ty)*
+                ) -> *mut $crate::async_com::AsyncOperationRaw<$ret_ty>
+                where
+                    T: $trait_name + $crate::ComImpl<P> + $crate::wrapper::SecondaryComImpl<S>,
+                    P: $crate::vtable::InterfaceVtable,
+                    S: $crate::wrapper::SecondaryVtables,
+                    S::Entries: $crate::wrapper::SecondaryList,
+                    A: $crate::allocator::Allocator + Send + Sync,
+                {
+                    if this.is_null() {
+                        return core::ptr::null_mut();
+                    }
+                    let wrapper = unsafe {
+                        $crate::wrapper::ComObjectN::<T, P, S, A>::from_ptr(this)
+                    };
+                    unsafe {
+                        $crate::wrapper::ComObjectN::<T, P, S, A>::shim_add_ref(this);
+                    }
+                    let init = wrapper.inner.$method_name($($arg_name),*);
+                    let release_fn: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 =
+                        $crate::wrapper::ComObjectN::<T, P, S, A>::shim_release;
+                    let guard_ptr = $crate::GuardPtr::new(this);
+                    #[cfg(all(feature = "async-com-fused", feature = "driver", feature = "async-com-kernel", not(miri)))]
+                    {
+                        let op = $crate::async_com::spawn_async_operation_raw_with_init::<$ret_ty, _, _>(
+                            init,
+                            guard_ptr,
+                            release_fn,
+                        );
+                        match op {
+                            Ok(ptr) => ptr,
+                            Err(status) => match $crate::async_com::spawn_async_operation_error_raw::<
+                                $ret_ty,
+                                <T as $trait_name>::[<$method_name:camel Future>],
+                            >(status) {
+                                Ok(ptr) => ptr,
+                                Err(_status) => core::ptr::null_mut(),
+                            },
+                        }
+                    }
+                    #[cfg(any(not(all(feature = "async-com-fused", feature = "driver", feature = "async-com-kernel")), miri))]
+                    {
+                        let mut future = match init.try_pin() {
+                            Ok(future) => future,
+                            Err(err) => {
+                                unsafe {
+                                    $crate::wrapper::ComObjectN::<T, P, S, A>::shim_release(this);
                                 }
                                 let status: $crate::NTSTATUS = err.into();
                                 return match $crate::async_com::spawn_async_operation_error_raw::<
@@ -491,6 +585,7 @@ macro_rules! __kcom_define_interface {
         trait_methods [$($trait_methods:tt)*],
         vtable_fields [$($vtable_fields:tt)*],
         vtable_inits [$($vtable_inits:tt)*],
+        vtable_inits_primary [$($vtable_inits_primary:tt)*],
         vtable_inits_secondary [$($vtable_inits_secondary:tt)*],
         shim_funcs [$($shim_funcs:tt)*],
         ;
@@ -522,6 +617,10 @@ macro_rules! __kcom_define_interface {
                 $($vtable_inits)*
                 $method_name: [<shim_ $trait_name _ $method_name>]::<T>,
             ],
+            vtable_inits_primary [
+                $($vtable_inits_primary)*
+                $method_name: [<shim_ $trait_name _ $method_name _primary>]::<T, P, S, A>,
+            ],
             vtable_inits_secondary [
                 $($vtable_inits_secondary)*
                 $method_name: [<shim_ $trait_name _ $method_name _secondary>]::<T, P, S, A, INDEX>,
@@ -538,6 +637,24 @@ macro_rules! __kcom_define_interface {
                 {
                     let wrapper = unsafe {
                         $crate::wrapper::ComObject::<T, [<$trait_name Vtbl>]>::from_ptr(this)
+                    };
+                    $crate::iunknown::IntoNtStatus::into_ntstatus(wrapper.inner.$method_name($($arg_name),*))
+                }
+                #[allow(non_snake_case)]
+                #[allow(dead_code)]
+                pub unsafe extern "system" fn [<shim_ $trait_name _ $method_name _primary>]<T, P, S, A>(
+                    this: *mut core::ffi::c_void
+                    $(, $arg_name: $arg_ty)*
+                ) -> $crate::NTSTATUS
+                where
+                    T: $trait_name + $crate::ComImpl<P> + $crate::wrapper::SecondaryComImpl<S>,
+                    P: $crate::vtable::InterfaceVtable,
+                    S: $crate::wrapper::SecondaryVtables,
+                    S::Entries: $crate::wrapper::SecondaryList,
+                    A: $crate::allocator::Allocator + Send + Sync,
+                {
+                    let wrapper = unsafe {
+                        $crate::wrapper::ComObjectN::<T, P, S, A>::from_ptr(this)
                     };
                     $crate::iunknown::IntoNtStatus::into_ntstatus(wrapper.inner.$method_name($($arg_name),*))
                 }
@@ -577,6 +694,7 @@ macro_rules! __kcom_define_interface {
         trait_methods [$($trait_methods:tt)*],
         vtable_fields [$($vtable_fields:tt)*],
         vtable_inits [$($vtable_inits:tt)*],
+        vtable_inits_primary [$($vtable_inits_primary:tt)*],
         vtable_inits_secondary [$($vtable_inits_secondary:tt)*],
         shim_funcs [$($shim_funcs:tt)*],
         ;
@@ -608,6 +726,10 @@ macro_rules! __kcom_define_interface {
                 $($vtable_inits)*
                 $method_name: [<shim_ $trait_name _ $method_name>]::<T>,
             ],
+            vtable_inits_primary [
+                $($vtable_inits_primary)*
+                $method_name: [<shim_ $trait_name _ $method_name _primary>]::<T, P, S, A>,
+            ],
             vtable_inits_secondary [
                 $($vtable_inits_secondary)*
                 $method_name: [<shim_ $trait_name _ $method_name _secondary>]::<T, P, S, A, INDEX>,
@@ -624,6 +746,24 @@ macro_rules! __kcom_define_interface {
                 {
                     let wrapper = unsafe {
                         $crate::wrapper::ComObject::<T, [<$trait_name Vtbl>]>::from_ptr(this)
+                    };
+                    $crate::iunknown::IntoNtStatus::into_ntstatus(wrapper.inner.$method_name($($arg_name),*))
+                }
+                #[allow(non_snake_case)]
+                #[allow(dead_code)]
+                pub unsafe extern "system" fn [<shim_ $trait_name _ $method_name _primary>]<T, P, S, A>(
+                    this: *mut core::ffi::c_void
+                    $(, $arg_name: $arg_ty)*
+                ) -> $crate::NTSTATUS
+                where
+                    T: $trait_name + $crate::ComImpl<P> + $crate::wrapper::SecondaryComImpl<S>,
+                    P: $crate::vtable::InterfaceVtable,
+                    S: $crate::wrapper::SecondaryVtables,
+                    S::Entries: $crate::wrapper::SecondaryList,
+                    A: $crate::allocator::Allocator + Send + Sync,
+                {
+                    let wrapper = unsafe {
+                        $crate::wrapper::ComObjectN::<T, P, S, A>::from_ptr(this)
                     };
                     $crate::iunknown::IntoNtStatus::into_ntstatus(wrapper.inner.$method_name($($arg_name),*))
                 }
@@ -663,6 +803,7 @@ macro_rules! __kcom_define_interface {
         trait_methods [$($trait_methods:tt)*],
         vtable_fields [$($vtable_fields:tt)*],
         vtable_inits [$($vtable_inits:tt)*],
+        vtable_inits_primary [$($vtable_inits_primary:tt)*],
         vtable_inits_secondary [$($vtable_inits_secondary:tt)*],
         shim_funcs [$($shim_funcs:tt)*],
         ;
@@ -694,6 +835,10 @@ macro_rules! __kcom_define_interface {
                 $($vtable_inits)*
                 $method_name: [<shim_ $trait_name _ $method_name>]::<T>,
             ],
+            vtable_inits_primary [
+                $($vtable_inits_primary)*
+                $method_name: [<shim_ $trait_name _ $method_name _primary>]::<T, P, S, A>,
+            ],
             vtable_inits_secondary [
                 $($vtable_inits_secondary)*
                 $method_name: [<shim_ $trait_name _ $method_name _secondary>]::<T, P, S, A, INDEX>,
@@ -710,6 +855,24 @@ macro_rules! __kcom_define_interface {
                 {
                     let wrapper = unsafe {
                         $crate::wrapper::ComObject::<T, [<$trait_name Vtbl>]>::from_ptr(this)
+                    };
+                    $crate::iunknown::IntoNtStatus::into_ntstatus(wrapper.inner.$method_name($($arg_name),*))
+                }
+                #[allow(non_snake_case)]
+                #[allow(dead_code)]
+                pub unsafe extern "system" fn [<shim_ $trait_name _ $method_name _primary>]<T, P, S, A>(
+                    this: *mut core::ffi::c_void
+                    $(, $arg_name: $arg_ty)*
+                ) -> $crate::NTSTATUS
+                where
+                    T: $trait_name + $crate::ComImpl<P> + $crate::wrapper::SecondaryComImpl<S>,
+                    P: $crate::vtable::InterfaceVtable,
+                    S: $crate::wrapper::SecondaryVtables,
+                    S::Entries: $crate::wrapper::SecondaryList,
+                    A: $crate::allocator::Allocator + Send + Sync,
+                {
+                    let wrapper = unsafe {
+                        $crate::wrapper::ComObjectN::<T, P, S, A>::from_ptr(this)
                     };
                     $crate::iunknown::IntoNtStatus::into_ntstatus(wrapper.inner.$method_name($($arg_name),*))
                 }
@@ -749,6 +912,7 @@ macro_rules! __kcom_define_interface {
         trait_methods [$($trait_methods:tt)*],
         vtable_fields [$($vtable_fields:tt)*],
         vtable_inits [$($vtable_inits:tt)*],
+        vtable_inits_primary [$($vtable_inits_primary:tt)*],
         vtable_inits_secondary [$($vtable_inits_secondary:tt)*],
         shim_funcs [$($shim_funcs:tt)*],
         ;
@@ -780,6 +944,10 @@ macro_rules! __kcom_define_interface {
                 $($vtable_inits)*
                 $method_name: [<shim_ $trait_name _ $method_name>]::<T>,
             ],
+            vtable_inits_primary [
+                $($vtable_inits_primary)*
+                $method_name: [<shim_ $trait_name _ $method_name _primary>]::<T, P, S, A>,
+            ],
             vtable_inits_secondary [
                 $($vtable_inits_secondary)*
                 $method_name: [<shim_ $trait_name _ $method_name _secondary>]::<T, P, S, A, INDEX>,
@@ -796,6 +964,24 @@ macro_rules! __kcom_define_interface {
                 {
                     let wrapper = unsafe {
                         $crate::wrapper::ComObject::<T, [<$trait_name Vtbl>]>::from_ptr(this)
+                    };
+                    $crate::__kcom_map_return!($ret_ty, wrapper.inner.$method_name($($arg_name),*))
+                }
+                #[allow(non_snake_case)]
+                #[allow(dead_code)]
+                pub unsafe extern "system" fn [<shim_ $trait_name _ $method_name _primary>]<T, P, S, A>(
+                    this: *mut core::ffi::c_void
+                    $(, $arg_name: $arg_ty)*
+                ) -> $ret_ty
+                where
+                    T: $trait_name + $crate::ComImpl<P> + $crate::wrapper::SecondaryComImpl<S>,
+                    P: $crate::vtable::InterfaceVtable,
+                    S: $crate::wrapper::SecondaryVtables,
+                    S::Entries: $crate::wrapper::SecondaryList,
+                    A: $crate::allocator::Allocator + Send + Sync,
+                {
+                    let wrapper = unsafe {
+                        $crate::wrapper::ComObjectN::<T, P, S, A>::from_ptr(this)
                     };
                     $crate::__kcom_map_return!($ret_ty, wrapper.inner.$method_name($($arg_name),*))
                 }

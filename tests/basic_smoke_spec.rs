@@ -248,6 +248,91 @@ fn basic_comrc_drop_after_all_refs() {
     assert_eq!(MULTI_DROP_COUNT.load(Ordering::Relaxed), 1);
 }
 
+declare_com_interface! {
+    pub trait IDerived: IPrimary {
+        const IID: GUID = GUID {
+            data1: 0xA55A_A55A,
+            data2: 0x1200,
+            data3: 0x3400,
+            data4: [0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34],
+        };
+
+        fn derived(&self) -> NTSTATUS;
+    }
+}
+
+struct DerivedMulti;
+
+impl IPrimary for DerivedMulti {
+    fn primary(&self) -> NTSTATUS {
+        STATUS_SUCCESS
+    }
+}
+
+impl IDerived for DerivedMulti {
+    fn derived(&self) -> NTSTATUS {
+        STATUS_SUCCESS
+    }
+}
+
+impl ISecondary for DerivedMulti {
+    fn secondary(&self) -> NTSTATUS {
+        STATUS_SUCCESS
+    }
+}
+
+impl_com_interface! {
+    impl DerivedMulti: IPrimary {
+        parent = IUnknownVtbl,
+        methods = [primary],
+    }
+}
+
+impl_com_interface! {
+    impl DerivedMulti: IDerived {
+        parent = IPrimaryVtbl,
+        secondaries = (ISecondary),
+        methods = [derived],
+    }
+}
+
+impl_com_interface_multiple! {
+    impl DerivedMulti: ISecondary {
+        parent = IUnknownVtbl,
+        primary = IDerived,
+        secondaries = (ISecondary),
+        methods = [secondary],
+    }
+}
+
+#[test]
+fn comobjectn_primary_derived_interface_uses_primary_shims_for_parent_vtable() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let ptr = ComObjectN::<DerivedMulti, IDerivedVtbl, (ISecondaryVtbl,)>::new(DerivedMulti)
+        .unwrap();
+
+    unsafe {
+        let vtbl = *(ptr as *mut *mut IDerivedVtbl);
+        assert_eq!(((*vtbl).derived)(ptr as *mut core::ffi::c_void), STATUS_SUCCESS);
+        assert_eq!(
+            ((*vtbl).parent.primary)(ptr as *mut core::ffi::c_void),
+            STATUS_SUCCESS
+        );
+
+        let mut primary = core::ptr::null_mut();
+        let status = ((*vtbl).parent.parent.QueryInterface)(
+            ptr as *mut core::ffi::c_void,
+            &<IPrimaryRaw as kcom::vtable::ComInterfaceInfo>::IID,
+            &mut primary,
+        );
+        assert_eq!(status, STATUS_SUCCESS);
+        assert_eq!(primary, ptr as *mut core::ffi::c_void);
+        let _ = ((*vtbl).parent.parent.Release)(primary);
+
+        let _ = ComObjectN::<DerivedMulti, IDerivedVtbl, (ISecondaryVtbl,)>::shim_release(ptr);
+    }
+}
+
 #[cfg(feature = "async-com")]
 mod async_smoke {
     use super::*;
