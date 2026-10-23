@@ -8,7 +8,18 @@ use crate::iunknown::{GUID, IUnknownVtbl, IID_IUNKNOWN};
 use crate::vtable::{ComInterfaceInfo, InterfaceVtable};
 
 /// Implementation logic for a COM interface.
-pub trait ComImpl<I: InterfaceVtable>: Sized + Sync + 'static {
+///
+/// # Safety
+/// The wrapper shims trust both items without further checks:
+/// - `VTABLE` must be a vtable of layout `I` whose IUnknown slots are the
+///   `ComObject`/`ComObjectN` shims for `Self` (or equivalent), since the
+///   wrapper hands it out as the object's interface pointer.
+/// - `query_interface` must only return live interface pointers of this object
+///   (or of an object it keeps alive) whose vtable matches `riid`; the wrapper
+///   calls `AddRef` through the returned pointer and gives it to the caller.
+///
+/// The `impl_com_interface!` family of macros upholds this.
+pub unsafe trait ComImpl<I: InterfaceVtable>: Sized + Sync + 'static {
     /// The VTable instance that delegates to `ComObject` shims.
     const VTABLE: &'static I;
 
@@ -38,7 +49,8 @@ impl ComInterfaceInfo for IUnknownInterface {
 }
 
 // Default implementation for IUnknown logic on the inner type.
-impl<T> ComImpl<IUnknownVtbl> for T
+// SAFETY: the vtable is the ComObject shims and no interface is returned.
+unsafe impl<T> ComImpl<IUnknownVtbl> for T
 where
     T: IUnknown + Sync + 'static,
 {
