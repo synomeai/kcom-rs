@@ -129,12 +129,28 @@ macro_rules! __kcom_define_interface {
                         + $crate::ComImpl<[<$trait_name Vtbl>]>
                         + $crate::ComImpl<$($parent_vtable)+>,
                 {
+                    Self::new_with::<T, [<$trait_name Vtbl>]>()
+                }
+
+                /// Builds this vtable for a `ComObject` whose most-derived interface is `D`.
+                ///
+                /// The IUnknown slots dispatch `QueryInterface` through `ComImpl<D>`, so a
+                /// base-interface vtable embedded in a derived one still answers for the
+                /// derived IID.
+                pub const fn new_with<T, D>() -> Self
+                where
+                    T: $trait_name
+                        + $crate::ComImpl<[<$trait_name Vtbl>]>
+                        + $crate::ComImpl<$($parent_vtable)+>
+                        + $crate::ComImpl<D>,
+                    D: $crate::vtable::InterfaceVtable,
+                {
                     Self {
                         parent: $crate::__kcom_parent_vtbl!(
                             $parent_kind,
                             $($parent_vtable)+,
                             T,
-                            [<$trait_name Vtbl>]
+                            D
                         ),
                         $($vtable_inits)*
                     }
@@ -157,8 +173,9 @@ macro_rules! __kcom_define_interface {
                 );
             }
 
+            // Not `Clone`/`Copy`: a copy would live at a different address than the
+            // COM object, and calling through it would hand the shims a bogus `this`.
             #[repr(C)]
-            #[derive(Clone, Copy)]
             #[allow(non_snake_case)]
             $vis struct [<$trait_name Raw>] {
                 pub lpVtbl: *mut [<$trait_name Vtbl>],
@@ -175,8 +192,14 @@ macro_rules! __kcom_define_interface {
             #[allow(dead_code)]
             impl [<$trait_name Raw>] {
                 /// Queries for another COM interface and returns a smart pointer on success.
+                ///
+                /// Prefer `ComRc::query_interface`, which is safe.
+                ///
+                /// # Safety
+                /// `self` must be the interface pointer of a live COM object (not a copy of
+                /// the `lpVtbl` field), and the vtable must begin with IUnknown methods.
                 #[inline]
-                pub fn query_interface<U>(&self) -> $crate::StatusResult<$crate::ComRc<U>>
+                pub unsafe fn query_interface<U>(&self) -> $crate::StatusResult<$crate::ComRc<U>>
                 where
                     U: $crate::smart_ptr::ComInterface + $crate::vtable::ComInterfaceInfo,
                 {
@@ -1013,11 +1036,11 @@ macro_rules! __kcom_define_interface {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __kcom_parent_vtbl {
-    (IUnknown, $parent_vtbl:ty, $ty:ty, $vtbl:ty) => {
-        $crate::IUnknownVtbl::new::<$ty, $vtbl>()
+    (IUnknown, $parent_vtbl:ty, $ty:ty, $derived:ty) => {
+        $crate::IUnknownVtbl::new::<$ty, $derived>()
     };
-    (Other, $parent_vtbl:ty, $ty:ty, $vtbl:ty) => {
-        <$parent_vtbl>::new::<$ty>()
+    (Other, $parent_vtbl:ty, $ty:ty, $derived:ty) => {
+        <$parent_vtbl>::new_with::<$ty, $derived>()
     };
 }
 

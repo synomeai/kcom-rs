@@ -114,11 +114,15 @@ pub(crate) fn sub(ref_count: &AtomicU32) -> u32 {
     }
 }
 
+/// Once `add` has saturated at `MAX_REFCOUNT`, some AddRefs were dropped, so
+/// the count no longer tracks the real owners. Decrementing from there would
+/// free the object while references remain; instead the object stays pinned
+/// at the cap and is leaked.
 #[cfg(all(feature = "refcount-hardening", feature = "leaky-hardening"))]
 #[inline]
 pub(crate) fn sub(ref_count: &AtomicU32) -> u32 {
     match ref_count.fetch_update(Ordering::Release, Ordering::Relaxed, |curr| {
-        if curr == 0 {
+        if curr == 0 || curr >= MAX_REFCOUNT {
             None
         } else {
             Some(curr - 1)
@@ -126,5 +130,28 @@ pub(crate) fn sub(ref_count: &AtomicU32) -> u32 {
     }) {
         Ok(prev) => prev - 1,
         Err(_) => MAX_REFCOUNT,
+    }
+}
+
+#[cfg(all(test, feature = "leaky-hardening"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_count_is_not_decremented() {
+        let count = AtomicU32::new(MAX_REFCOUNT - 1);
+        assert_eq!(add(&count), MAX_REFCOUNT);
+        // Saturated: this AddRef is dropped.
+        assert_eq!(add(&count), MAX_REFCOUNT);
+        // Releases must not walk the count back toward zero.
+        assert_eq!(sub(&count), MAX_REFCOUNT);
+        assert_eq!(count.load(Ordering::Relaxed), MAX_REFCOUNT);
+    }
+
+    #[test]
+    fn underflow_is_ignored() {
+        let count = AtomicU32::new(0);
+        assert_eq!(sub(&count), MAX_REFCOUNT);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 }

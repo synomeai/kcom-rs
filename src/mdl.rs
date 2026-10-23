@@ -61,6 +61,21 @@ impl MdlGuard {
         unsafe { free_mdl(self.mdl, self.kind) };
         self.mdl = core::ptr::null_mut();
     }
+
+    /// Gives up ownership of the MDL without freeing it.
+    pub fn into_raw(self) -> PMDL {
+        let this = core::mem::ManuallyDrop::new(self);
+        this.mdl
+    }
+}
+
+impl Drop for MdlGuard {
+    fn drop(&mut self) {
+        if !self.mdl.is_null() {
+            // SAFETY: the guard owns `mdl` (see `from_raw`/`from_nonpaged`).
+            unsafe { free_mdl(self.mdl, self.kind) };
+        }
+    }
 }
 
 /// # Safety

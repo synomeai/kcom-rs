@@ -122,6 +122,29 @@ impl Drop for PanicGuard {
     }
 }
 
+/// Refcount held while `inner` is being dropped.
+///
+/// A balanced `AddRef`/`Release` pair made from inside `T::drop` (for example
+/// through a stored self pointer) moves the count away from this value and
+/// back, instead of reaching zero a second time and freeing the object twice.
+/// It is below `refcount::MAX_REFCOUNT` so hardened builds accept it.
+const DESTRUCTING_REFCOUNT: u32 = 1 << 30;
+
+/// Drops `inner` under the destructing sentinel and checks for resurrection.
+///
+/// # Safety
+/// `ref_count` and `inner` must point into a live object whose refcount just
+/// reached zero, and `inner` must not be used afterwards.
+#[inline]
+unsafe fn drop_inner_checked<T>(ref_count: *const AtomicU32, inner: *mut T) {
+    let ref_count = unsafe { &*ref_count };
+    ref_count.store(DESTRUCTING_REFCOUNT, Ordering::Relaxed);
+    unsafe { core::ptr::drop_in_place(inner) };
+    if ref_count.load(Ordering::Acquire) != DESTRUCTING_REFCOUNT {
+        resurrection_violation();
+    }
+}
+
 #[inline]
 unsafe fn delegating_add_ref(
     outer_unknown: Option<*mut c_void>,
@@ -492,19 +515,23 @@ where
         let guard = PanicGuard::new();
         let wrapper = unsafe { &*(this as *const Self) };
         let result = delegating_release(wrapper.outer_unknown, &wrapper.ref_count, || {
-            let ptr = this as *mut Self;
-            let alloc = core::ptr::read(&(*ptr).alloc);
-            let alloc = ManuallyDrop::into_inner(alloc);
-            core::ptr::drop_in_place(&mut (*ptr).inner);
-            let resurrected = (*ptr).ref_count.load(Ordering::Acquire);
-            if resurrected != 0 {
-                resurrection_violation();
-            }
-            alloc.dealloc(ptr as *mut u8, Self::LAYOUT);
-            drop(alloc);
+            Self::destroy(this as *mut Self);
         });
         core::mem::forget(guard);
         result
+    }
+
+    /// # Safety
+    /// `ptr` must be a live object whose refcount just reached zero.
+    unsafe fn destroy(ptr: *mut Self) {
+        unsafe {
+            drop_inner_checked(
+                core::ptr::addr_of!((*ptr).ref_count),
+                core::ptr::addr_of_mut!((*ptr).inner),
+            );
+            let alloc = ManuallyDrop::into_inner(core::ptr::read(core::ptr::addr_of!((*ptr).alloc)));
+            alloc.dealloc(ptr as *mut u8, Self::LAYOUT);
+        }
     }
 
     #[allow(non_snake_case)]
@@ -662,17 +689,7 @@ where
 
         if count == 0 {
             core::sync::atomic::fence(Ordering::Acquire);
-            let alloc = unsafe { core::ptr::read(core::ptr::addr_of!((*ptr).alloc)) };
-            let alloc = ManuallyDrop::into_inner(alloc);
-            unsafe {
-                core::ptr::drop_in_place(core::ptr::addr_of_mut!((*ptr).inner));
-                let resurrected = (*ptr).ref_count.load(Ordering::Acquire);
-                if resurrected != 0 {
-                    resurrection_violation();
-                }
-                alloc.dealloc(ptr as *mut u8, Self::LAYOUT);
-            }
-            drop(alloc);
+            unsafe { Self::destroy(ptr) };
         }
 
         core::mem::forget(guard);
@@ -745,6 +762,15 @@ where
     non_delegating_unknown: NonDelegatingIUnknown<T, I, A>,
     ref_count: AtomicU32,
     outer_unknown: Option<*mut c_void>,
+    /// Frees the object with the allocator and layout it was created with.
+    ///
+    /// `ComImpl::VTABLE` is fixed per `(T, I)`, so the IUnknown and method shims
+    /// are monomorphized for `ComObject<T, I, GlobalAllocator>` (and, for
+    /// inherited interfaces, for a different `I`) no matter which `A` built the
+    /// object. Every field the shims touch precedes `alloc` and has the same
+    /// offset for every `I` and `A` (checked by `PREFIX_LAYOUT_CHECK`); this
+    /// pointer is how they reach the `A`-specific teardown.
+    destroy: unsafe fn(*mut c_void),
     pub inner: T,
     alloc: ManuallyDrop<A>,
 }
@@ -761,11 +787,35 @@ where
         AddRef: Self::shim_non_delegating_add_ref,
         Release: Self::shim_non_delegating_release,
     };
+    const PREFIX_LAYOUT_CHECK: () = {
+        type G<T, I> = ComObject<T, I, GlobalAllocator>;
+        assert!(core::mem::offset_of!(Self, ref_count) == core::mem::offset_of!(G<T, I>, ref_count));
+        assert!(
+            core::mem::offset_of!(Self, outer_unknown)
+                == core::mem::offset_of!(G<T, I>, outer_unknown)
+        );
+        assert!(core::mem::offset_of!(Self, destroy) == core::mem::offset_of!(G<T, I>, destroy));
+        assert!(core::mem::offset_of!(Self, inner) == core::mem::offset_of!(G<T, I>, inner));
+    };
 
     #[inline]
     fn init_non_delegating_ptr(ptr: *mut Self) {
         unsafe {
             (*ptr).non_delegating_unknown.parent = ptr;
+        }
+    }
+
+    /// # Safety
+    /// `this` must be a live `ComObject<T, I, A>` whose refcount just reached zero.
+    unsafe fn destroy(this: *mut c_void) {
+        let ptr = this as *mut Self;
+        unsafe {
+            drop_inner_checked(
+                core::ptr::addr_of!((*ptr).ref_count),
+                core::ptr::addr_of_mut!((*ptr).inner),
+            );
+            let alloc = ManuallyDrop::into_inner(core::ptr::read(core::ptr::addr_of!((*ptr).alloc)));
+            alloc.dealloc(ptr as *mut u8, Self::LAYOUT);
         }
     }
 
@@ -801,6 +851,7 @@ where
 
     #[inline]
     pub fn try_new_in(inner: T, alloc: A) -> Option<*mut c_void> {
+        let () = Self::PREFIX_LAYOUT_CHECK;
         let ptr = unsafe { alloc.alloc(Self::LAYOUT) } as *mut Self;
         if ptr.is_null() {
             return None;
@@ -814,6 +865,7 @@ where
                 },
                 ref_count: AtomicU32::new(1),
                 outer_unknown: None,
+                destroy: Self::destroy,
                 inner,
                 alloc: ManuallyDrop::new(alloc),
             });
@@ -854,6 +906,7 @@ where
         outer_unknown: *mut c_void,
         alloc: A,
     ) -> Option<*mut c_void> {
+        let () = Self::PREFIX_LAYOUT_CHECK;
         let ptr = unsafe { alloc.alloc(Self::LAYOUT) } as *mut Self;
         if ptr.is_null() {
             return None;
@@ -867,6 +920,7 @@ where
                 },
                 ref_count: AtomicU32::new(1),
                 outer_unknown: Some(outer_unknown),
+                destroy: Self::destroy,
                 inner,
                 alloc: ManuallyDrop::new(alloc),
             });
@@ -933,17 +987,10 @@ where
     pub unsafe extern "system" fn shim_release(this: *mut c_void) -> u32 {
         let guard = PanicGuard::new();
         let wrapper = unsafe { &*(this as *const Self) };
+        let destroy = wrapper.destroy;
         let result = delegating_release(wrapper.outer_unknown, &wrapper.ref_count, || {
-            let ptr = this as *mut Self;
-            let alloc = core::ptr::read(&(*ptr).alloc);
-            let alloc = ManuallyDrop::into_inner(alloc);
-            core::ptr::drop_in_place(&mut (*ptr).inner);
-            let resurrected = (*ptr).ref_count.load(Ordering::Acquire);
-            if resurrected != 0 {
-                resurrection_violation();
-            }
-            alloc.dealloc(ptr as *mut u8, Self::LAYOUT);
-            drop(alloc);
+            // `Self` may not be the type the object was built with; see `destroy`.
+            destroy(this);
         });
         core::mem::forget(guard);
         result
@@ -1017,17 +1064,7 @@ where
 
         if count == 0 {
             core::sync::atomic::fence(Ordering::Acquire);
-            let alloc = unsafe { core::ptr::read(core::ptr::addr_of!((*ptr).alloc)) };
-            let alloc = ManuallyDrop::into_inner(alloc);
-            unsafe {
-                core::ptr::drop_in_place(core::ptr::addr_of_mut!((*ptr).inner));
-                let resurrected = (*ptr).ref_count.load(Ordering::Acquire);
-                if resurrected != 0 {
-                    resurrection_violation();
-                }
-                alloc.dealloc(ptr as *mut u8, Self::LAYOUT);
-            }
-            drop(alloc);
+            unsafe { ((*ptr).destroy)(ptr as *mut c_void) };
         }
 
         core::mem::forget(guard);
@@ -1137,6 +1174,8 @@ mod tests {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static DROP_COUNT: AtomicU32 = AtomicU32::new(0);
+    // The tests share DROP_COUNT, so they must not run concurrently.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static OUTER_ADDREF_COUNT: AtomicU32 = AtomicU32::new(0);
     static OUTER_RELEASE_COUNT: AtomicU32 = AtomicU32::new(0);
     static OUTER_QUERY_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -1186,6 +1225,7 @@ mod tests {
 
     #[test]
     fn add_ref_release_drops() {
+        let _guard = TEST_LOCK.lock().unwrap();
         DROP_COUNT.store(0, Ordering::Relaxed);
 
         let ptr = ComObject::<Dummy, IUnknownVtbl>::new(Dummy).unwrap();
@@ -1201,6 +1241,7 @@ mod tests {
 
     #[test]
     fn query_interface_iunknown_returns_self() {
+        let _guard = TEST_LOCK.lock().unwrap();
         DROP_COUNT.store(0, Ordering::Relaxed);
 
         let ptr = ComObject::<Dummy, IUnknownVtbl>::new(Dummy).unwrap();
@@ -1227,6 +1268,7 @@ mod tests {
 
     #[test]
     fn aggregated_non_delegating_and_delegating_paths() {
+        let _guard = TEST_LOCK.lock().unwrap();
         DROP_COUNT.store(0, Ordering::Relaxed);
         OUTER_ADDREF_COUNT.store(0, Ordering::Relaxed);
         OUTER_RELEASE_COUNT.store(0, Ordering::Relaxed);

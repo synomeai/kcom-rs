@@ -149,9 +149,13 @@ impl IFoo for Foo {
     }
 }
 
-impl ComImpl<IFooVtbl> for Foo {
+// SAFETY: the vtable is built from kcom's shims for `Foo`, and
+// query_interface only returns `this` for IFoo.
+unsafe impl ComImpl<IFooVtbl> for Foo {
     const VTABLE: &'static IFooVtbl = &IFooVtbl {
-        parent: *<Foo as ComImpl<IUnknownVtbl>>::VTABLE,
+        // Pass the most-derived vtable so QueryInterface dispatches through
+        // `ComImpl<IFooVtbl>` and answers for IID_IFoo.
+        parent: IUnknownVtbl::new::<Foo, IFooVtbl>(),
         ping: shim_IFoo_ping::<Foo>,
     };
 

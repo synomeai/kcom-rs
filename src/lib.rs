@@ -23,6 +23,7 @@ pub mod task;
 pub mod vtable;
 pub mod async_com_metrics;
 mod refcount;
+mod sync_state;
 pub mod trace;
 mod guard_ptr;
 #[cfg(feature = "async-com")]
