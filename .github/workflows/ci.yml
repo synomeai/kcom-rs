@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host-tests:
+    name: Host tests (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "refcount-hardening"
+          - "async-com"
+          - "async-impl,kernel-unicode" # docs.rs feature set
+          - "async-com,async-com-metrics"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: kcom unit tests
+        run: cargo test -p kcom --lib --features "${{ matrix.features }}"
+      - name: kcom-tests
+        run: cargo test -p kcom-tests --features "${{ matrix.features }}"
+      - name: Examples
+        run: cargo build -p kcom --examples --features "${{ matrix.features }}"
+
+  leaky-hardening:
+    name: Host tests (leaky-hardening)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p kcom --lib --features leaky-hardening
+
+  miri:
+    name: Miri (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "async-impl,kernel-unicode"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri setup
+      - name: kcom unit tests
+        run: cargo miri test -p kcom --lib --features "${{ matrix.features }}"
+      - name: kcom-tests
+        run: cargo miri test -p kcom-tests --tests --features "${{ matrix.features }}"
