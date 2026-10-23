@@ -283,15 +283,39 @@ pub struct GlobalAllocator;
 #[cfg(all(feature = "driver", not(miri)))]
 const GLOBAL_POOL_TAG: u32 = u32::from_ne_bytes(*b"KCOM");
 
+/// Returns a non-null, well-aligned pointer for a zero-sized allocation.
+///
+/// `NonNull::dangling()` is only aligned to 1, so it must not be used for
+/// layouts with a larger alignment.
+#[inline]
+pub(crate) fn dangling_for(layout: Layout) -> *mut u8 {
+    ptr::null_mut::<u8>().wrapping_add(layout.align())
+}
+
 #[cfg(any(not(feature = "driver"), miri))]
 impl Allocator for GlobalAllocator {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // `GlobalAlloc` forbids zero-sized requests.
+        if layout.size() == 0 {
+            return dangling_for(layout);
+        }
         alloc::alloc::alloc(layout)
     }
 
     #[inline]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if layout.size() == 0 {
+            return dangling_for(layout);
+        }
+        alloc::alloc::alloc_zeroed(layout)
+    }
+
+    #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if layout.size() == 0 {
+            return;
+        }
         alloc::alloc::dealloc(ptr, layout)
     }
 }
@@ -478,7 +502,7 @@ impl WdkAllocator {
     #[inline]
     pub unsafe fn alloc_uninitialized(&self, layout: Layout) -> *mut u8 {
         if layout.size() == 0 {
-            return core::ptr::NonNull::<u8>::dangling().as_ptr();
+            return dangling_for(layout);
         }
 
         #[cfg(feature = "wdk-alloc-align")]
@@ -514,7 +538,7 @@ impl Allocator for WdkAllocator {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.size() == 0 {
-            return core::ptr::NonNull::<u8>::dangling().as_ptr();
+            return dangling_for(layout);
         }
 
         #[cfg(feature = "wdk-alloc-align")]
@@ -538,7 +562,7 @@ impl Allocator for WdkAllocator {
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if layout.size() == 0 {
-            return core::ptr::NonNull::<u8>::dangling().as_ptr();
+            return dangling_for(layout);
         }
 
         #[cfg(feature = "wdk-alloc-align")]
@@ -600,12 +624,21 @@ impl Allocator for WdkAllocator {
     }
 }
 
+// Values from wdm.h. Note that 0x1 is POOL_FLAG_USE_QUOTA, not PAGED.
 #[cfg(all(feature = "driver", not(miri)))]
-const POOL_FLAG_PAGED: u64 = 0x0000_0001;
+const POOL_FLAG_PAGED: u64 = 0x0000_0100;
 #[cfg(all(feature = "driver", not(miri)))]
 const POOL_FLAG_UNINITIALIZED: u64 = 0x0000_0002;
 #[cfg(all(feature = "driver", not(miri)))]
 const POOL_FLAG_NON_PAGED: u64 = 0x0000_0040;
+
+// Guard against drift from the WDK definitions.
+#[cfg(all(feature = "driver", not(miri)))]
+const _: () = {
+    assert!(POOL_FLAG_PAGED == wdk_sys::POOL_FLAG_PAGED as u64);
+    assert!(POOL_FLAG_UNINITIALIZED == wdk_sys::POOL_FLAG_UNINITIALIZED as u64);
+    assert!(POOL_FLAG_NON_PAGED == wdk_sys::POOL_FLAG_NON_PAGED as u64);
+};
 
 #[cfg(all(feature = "driver", not(miri)))]
 const POOL_TYPE_PAGED: u32 = 1;
