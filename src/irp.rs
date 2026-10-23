@@ -31,7 +31,7 @@ use wdk_sys::ntddk::{
 };
 
 #[cfg(all(driver_model__driver_type = "WDM", not(miri)))]
-use crate::ntddk::{IoAllocateWorkItem, IoFreeWorkItem, IoQueueWorkItem, PIO_WORKITEM, PIO_WORKITEM_ROUTINE, WORK_QUEUE_TYPE};
+use crate::ntddk::{IoAllocateWorkItem, IoFreeWorkItem, IoQueueWorkItem, _IO_WORKITEM, _WORK_QUEUE_TYPE};
 
 const IRP_FUTURE_TAG: u32 = u32::from_ne_bytes(*b"irpf");
 const STATUS_MORE_PROCESSING_REQUIRED: NTSTATUS = 0xC000_0016u32 as i32;
@@ -324,7 +324,7 @@ struct IrpFutureInner {
     wake_mode: IrpWakeMode,
     ownership: IrpOwnership,
     #[cfg(all(driver_model__driver_type = "WDM", not(miri)))]
-    work_item: AtomicPtr<PIO_WORKITEM>,
+    work_item: AtomicPtr<_IO_WORKITEM>,
 }
 
 impl IrpFutureInner {
@@ -484,8 +484,8 @@ impl IrpFutureInner {
         unsafe {
             IoQueueWorkItem(
                 work_item,
-                Some(Self::work_item_routine as PIO_WORKITEM_ROUTINE),
-                WORK_QUEUE_TYPE::DelayedWorkQueue,
+                Some(Self::work_item_routine),
+                _WORK_QUEUE_TYPE::DelayedWorkQueue,
                 ptr.as_ptr() as *mut c_void,
             );
         }

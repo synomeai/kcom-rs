@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 #[cfg(all(feature = "driver", feature = "async-com-kernel", driver_model__driver_type = "WDM", not(miri)))]
 use crate::ntddk::{
     DEVICE_OBJECT, IoAllocateWorkItem, IoFreeWorkItem, IoQueueWorkItem, ObDereferenceObject,
-    ObReferenceObject, PIO_WORKITEM, PIO_WORKITEM_ROUTINE, WORK_QUEUE_TYPE,
+    ObReferenceObject, _IO_WORKITEM, _WORK_QUEUE_TYPE,
 };
 
 #[cfg(any(not(all(feature = "driver", feature = "async-com-kernel", driver_model__driver_type = "WDM")), miri))]
@@ -1083,7 +1083,7 @@ where
     future: UnsafeCell<ManuallyDrop<F>>,
     device: *mut DEVICE_OBJECT,
     tracker: *const WorkItemTracker,
-    work_item: AtomicPtr<PIO_WORKITEM>,
+    work_item: AtomicPtr<_IO_WORKITEM>,
 }
 
 /// Handle for requesting cancellation on a work-item task.
@@ -1342,8 +1342,8 @@ where
         unsafe {
             IoQueueWorkItem(
                 work_item,
-                Some(Self::work_item_routine as PIO_WORKITEM_ROUTINE),
-                WORK_QUEUE_TYPE::DelayedWorkQueue,
+                Some(Self::work_item_routine),
+                _WORK_QUEUE_TYPE::DelayedWorkQueue,
                 ptr.as_ptr() as *mut c_void,
             );
         }
