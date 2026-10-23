@@ -178,24 +178,27 @@ impl<T: AsyncValueType> AsyncOperationRaw<T> {
     }
 }
 
+// Kernel builds draw task objects from a per-layout lookaside pool; host and
+// Miri builds use the global allocator. (A generic alias that ignores `T` is
+// rejected with E0091, so the alias is split on the object type instead.)
 #[cfg(all(feature = "driver", feature = "async-com-kernel", not(miri)))]
-type AsyncComAlloc<T> = pool::AsyncComAlloc<T>;
+type TaskComObject<T, F> =
+    ComObject<AsyncOperationTask<T, F>, AsyncOperationVtbl<T>, pool::AsyncComAlloc<T>>;
 #[cfg(any(not(all(feature = "driver", feature = "async-com-kernel")), miri))]
-type AsyncComAlloc<T> = crate::allocator::GlobalAllocator;
+type TaskComObject<T, F> =
+    ComObject<AsyncOperationTask<T, F>, AsyncOperationVtbl<T>, crate::allocator::GlobalAllocator>;
 
+#[cfg(all(feature = "driver", feature = "async-com-kernel", not(miri)))]
 #[inline]
-fn async_com_alloc<T: AsyncValueType>() -> AsyncComAlloc<T> {
-    #[cfg(all(feature = "driver", feature = "async-com-kernel", not(miri)))]
-    {
-        return AsyncComAlloc::<T>::new();
-    }
-    #[cfg(any(not(all(feature = "driver", feature = "async-com-kernel")), miri))]
-    {
-        crate::allocator::GlobalAllocator
-    }
+fn async_com_alloc<T: AsyncValueType>() -> pool::AsyncComAlloc<T> {
+    pool::AsyncComAlloc::<T>::new()
 }
 
-type TaskComObject<T, F> = ComObject<AsyncOperationTask<T, F>, AsyncOperationVtbl<T>, AsyncComAlloc<T>>;
+#[cfg(any(not(all(feature = "driver", feature = "async-com-kernel")), miri))]
+#[inline]
+fn async_com_alloc<T: AsyncValueType>() -> crate::allocator::GlobalAllocator {
+    crate::allocator::GlobalAllocator
+}
 
 pub struct AsyncOperationTask<T, F>
 where

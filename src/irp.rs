@@ -21,6 +21,7 @@ use crate::iunknown::{
 #[cfg(any(not(driver_model__driver_type = "WDM"), miri))]
 use crate::iunknown::STATUS_NOT_SUPPORTED;
 use crate::refcount;
+use crate::sync_state::CancelHandshake;
 use crate::smart_ptr::ComRc;
 use crate::ntddk::{KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock, KeReleaseSpinLock, KIRQL, KSPIN_LOCK};
 
@@ -38,6 +39,9 @@ const STATUS_MORE_PROCESSING_REQUIRED: NTSTATUS = 0xC000_0016u32 as i32;
 const STATE_INIT: u32 = 0;
 const STATE_DISPATCHING: u32 = 1;
 const STATE_DISPATCHED: u32 = 2;
+/// `finish` has claimed completion but not yet published status/information.
+const STATE_COMPLETING: u32 = 4;
+/// Status and information are published; set only after they are stored.
 const STATE_DONE: u32 = 3;
 
 /// Result for an IRP-backed future.
@@ -161,6 +165,8 @@ impl IrpFuture {
                     information: AtomicUsize::new(0),
                     waker: SpinLock::new(None),
                     irp: AtomicPtr::new(irp),
+                    cancel_target: irp,
+                    cancel_handshake: CancelHandshake::new(),
                     target_device,
                     on_complete: options.on_complete,
                     on_cleanup: options.on_cleanup,
@@ -285,9 +291,14 @@ impl Drop for IrpFuture {
             let irp = inner.take_irp();
             unsafe { IrpFutureInner::finish(self.inner, irp, STATUS_CANCELLED, 0) };
         } else if state != STATE_DONE {
-            let irp = inner.irp.load(Ordering::Acquire);
-            if !irp.is_null() {
-                unsafe { IoCancelIrp(irp) };
+            // The completion routine may be freeing the IRP concurrently (and
+            // IoCancelIrp can complete it synchronously on this thread). The
+            // handshake defers that free until IoCancelIrp has returned.
+            if inner.cancel_handshake.begin_cancel() {
+                unsafe { IoCancelIrp(inner.cancel_target) };
+                if let Some(irp) = inner.cancel_handshake.end_cancel() {
+                    unsafe { IrpFutureInner::dispose_irp(inner, irp) };
+                }
             }
         }
 
@@ -302,6 +313,10 @@ struct IrpFutureInner {
     information: AtomicUsize,
     waker: SpinLock<Option<Waker>>,
     irp: AtomicPtr<IRP>,
+    /// The IRP passed to `IoCancelIrp`. Only valid while `cancel_handshake`
+    /// says it has not been disposed of.
+    cancel_target: *mut IRP,
+    cancel_handshake: CancelHandshake<IRP>,
     target_device: *mut DEVICE_OBJECT,
     on_complete: Option<IrpCompleteFn>,
     on_cleanup: Option<IrpCleanupFn>,
@@ -392,23 +407,47 @@ impl IrpFutureInner {
 
     unsafe fn finish(ptr: NonNull<Self>, irp: *mut IRP, status: NTSTATUS, information: usize) {
         let inner = unsafe { &*ptr.as_ptr() };
-        let prev = inner.state.swap(STATE_DONE, Ordering::AcqRel);
-        if prev == STATE_DONE {
-            return;
+        // Claim completion first, publish the result, and only then mark the
+        // future DONE: `poll` reads status/information as soon as it sees DONE.
+        let mut state = inner.state.load(Ordering::Acquire);
+        loop {
+            if state == STATE_DONE || state == STATE_COMPLETING {
+                return;
+            }
+            match inner.state.compare_exchange_weak(
+                state,
+                STATE_COMPLETING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => state = actual,
+            }
         }
 
-        inner.status.store(status, Ordering::Release);
-        inner.information.store(information, Ordering::Release);
+        inner.status.store(status, Ordering::Relaxed);
+        inner.information.store(information, Ordering::Relaxed);
+        inner.state.store(STATE_DONE, Ordering::Release);
 
         unsafe { Self::wake(ptr) };
 
         if !irp.is_null() {
-            if let Some(cb) = inner.on_cleanup {
-                unsafe { cb(inner.context) };
+            if let Some(irp) = inner.cancel_handshake.complete(irp) {
+                unsafe { Self::dispose_irp(inner, irp) };
             }
-            if inner.ownership == IrpOwnership::Future {
-                unsafe { IoFreeIrp(irp) };
-            }
+        }
+    }
+
+    /// Runs the cleanup callback and frees the IRP if the future owns it.
+    unsafe fn dispose_irp(inner: &Self, irp: *mut IRP) {
+        if irp.is_null() {
+            return;
+        }
+        if let Some(cb) = inner.on_cleanup {
+            unsafe { cb(inner.context) };
+        }
+        if inner.ownership == IrpOwnership::Future {
+            unsafe { IoFreeIrp(irp) };
         }
     }
 
