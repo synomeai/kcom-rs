@@ -17,7 +17,7 @@ pub use wdk_sys::ntddk::{
     KeAcquireSpinLockRaiseToDpc, KeBugCheckEx, KeCancelTimer, KeGetCurrentIrql, KeInitializeDpc,
     KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer, KeInsertQueueDpc,
     KeQueryPerformanceCounter, KeReleaseSpinLock, KeRemoveQueueDpc, KeSetEvent, KeSetTimer,
-    KeWaitForSingleObject, MmGetSystemRoutineAddress,
+    KeWaitForSingleObject, MmGetSystemRoutineAddress, KeFlushQueuedDpcs,
 };
 #[cfg(all(feature = "driver", not(miri)))]
 pub use wdk_sys::_EVENT_TYPE::SynchronizationEvent;

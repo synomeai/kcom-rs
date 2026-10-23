@@ -1078,7 +1078,9 @@ where
     poll_state: PollState,
     completed: AtomicU32,
     cancel_requested: AtomicU32,
-    future: ManuallyDrop<F>,
+    // In an UnsafeCell: wakers and `cancel` take `&WorkItemTask` while the
+    // routine holds `&mut` to the future.
+    future: UnsafeCell<ManuallyDrop<F>>,
     device: *mut DEVICE_OBJECT,
     tracker: *const WorkItemTracker,
     work_item: AtomicPtr<PIO_WORKITEM>,
@@ -1216,14 +1218,6 @@ impl WorkItemTracker {
 
 #[cfg(all(feature = "driver", feature = "async-com-kernel", driver_model__driver_type = "WDM", not(miri)))]
 #[inline]
-unsafe fn tracker_begin(tracker: *const WorkItemTracker) {
-    if !tracker.is_null() {
-        unsafe { (*tracker).begin() };
-    }
-}
-
-#[cfg(all(feature = "driver", feature = "async-com-kernel", driver_model__driver_type = "WDM", not(miri)))]
-#[inline]
 unsafe fn tracker_complete(tracker: *const WorkItemTracker) {
     if !tracker.is_null() {
         unsafe { (*tracker).complete() };
@@ -1255,7 +1249,7 @@ where
                     poll_state: PollState::new(),
                     completed: AtomicU32::new(0),
                     cancel_requested: AtomicU32::new(0),
-                    future: ManuallyDrop::new(future),
+                    future: UnsafeCell::new(ManuallyDrop::new(future)),
                     device: null_mut(),
                     tracker: core::ptr::null(),
                     work_item: AtomicPtr::new(null_mut()),
@@ -1285,7 +1279,13 @@ where
 
     unsafe fn free(ptr: NonNull<Self>) {
         let alloc = WdkAllocator::new(PoolType::NonPagedNx, Self::alloc_tag());
-        let device = unsafe { (*ptr.as_ptr()).device };
+        let task = unsafe { &*ptr.as_ptr() };
+        let device = task.device;
+        let tracker = task.tracker;
+        if task.completed.load(Ordering::Acquire) == 0 {
+            // Released without finishing (e.g. the initial schedule failed).
+            unsafe { ManuallyDrop::drop(&mut *task.future.get()) };
+        }
         unsafe {
             drop(KBox::from_raw_parts(
                 ptr,
@@ -1296,6 +1296,9 @@ where
         if !device.is_null() {
             unsafe { ObDereferenceObject(device.cast()) };
         }
+        // The tracker counts the task's whole lifetime (begun at spawn), so a
+        // wake can never reach a drained tracker. Must be the last access.
+        unsafe { tracker_complete(tracker) };
     }
 
     unsafe fn schedule(ptr: NonNull<Self>) -> NTSTATUS {
@@ -1310,27 +1313,24 @@ where
             return STATUS_SUCCESS;
         }
 
-        unsafe { Self::queue_work_item(ptr) }
+        let status = unsafe { Self::queue_work_item(ptr) };
+        if status != STATUS_SUCCESS {
+            task.poll_state.abort_queue();
+        }
+        status
     }
 
     /// Allocates and queues a work item. The caller must have moved
-    /// `poll_state` to queued; on failure it is reset to idle.
+    /// `poll_state` to queued and handles failure.
     unsafe fn queue_work_item(ptr: NonNull<Self>) -> NTSTATUS {
         let task = unsafe { &*ptr.as_ptr() };
-        let tracker = task.tracker;
-        unsafe { tracker_begin(tracker) };
-
         let device = task.device;
         if device.is_null() {
-            task.poll_state.abort_queue();
-            unsafe { tracker_complete(tracker) };
             return STATUS_INVALID_PARAMETER;
         }
 
         let work_item = unsafe { IoAllocateWorkItem(device) };
         if work_item.is_null() {
-            task.poll_state.abort_queue();
-            unsafe { tracker_complete(tracker) };
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1359,7 +1359,11 @@ where
             .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Acquire)
             .is_ok()
         {
-            let _ = unsafe { Self::schedule(ptr) };
+            if unsafe { Self::schedule(ptr) } != STATUS_SUCCESS {
+                // Nothing was queued to observe the request; let a later
+                // `cancel` try again instead of becoming a no-op.
+                header.cancel_requested.store(0, Ordering::Release);
+            }
         }
     }
 
@@ -1374,49 +1378,48 @@ where
 
         // Short-lived borrows only: the future is polled through `&mut` below.
         let task = || unsafe { &*ptr.as_ptr() };
-        let tracker = task().tracker;
-
         // Exclusive until `end_run`; nobody queues another work item for this
         // task meanwhile, so the slot holds the item running this routine.
         task().poll_state.begin_run();
         let work_item = task().work_item.swap(null_mut(), Ordering::AcqRel);
 
-        let mut requeue = false;
-        if task().completed.load(Ordering::Acquire) == 0 {
+        while task().completed.load(Ordering::Acquire) == 0 {
             let cancelled = task().cancel_requested.load(Ordering::Acquire) != 0;
             if cancelled {
                 task().completed.store(1, Ordering::Release);
-                unsafe { ManuallyDrop::drop(&mut (*ptr.as_ptr()).future) };
-            } else {
-                let waker = unsafe { Waker::from_raw(Self::raw_waker_borrowed(ptr)) };
-                let mut cx = Context::from_waker(&waker);
-
-                let poll = unsafe {
-                    let task = &mut *ptr.as_ptr();
-                    let fut = Pin::new_unchecked(&mut *task.future);
-                    fut.poll(&mut cx)
-                };
-
-                if let Poll::Ready(_status) = poll {
-                    task().completed.store(1, Ordering::Release);
-                    unsafe { ManuallyDrop::drop(&mut (*ptr.as_ptr()).future) };
-                } else {
-                    // Completed tasks stay "running"; wakers only set a flag.
-                    requeue = task().poll_state.end_run(false);
-                }
+                unsafe { ManuallyDrop::drop(&mut *task().future.get()) };
+                break;
             }
-        }
 
-        if requeue {
-            // Begins a new tracked item before this one completes below.
-            let _ = unsafe { Self::queue_work_item(ptr) };
+            let waker = unsafe { Waker::from_raw(Self::raw_waker_borrowed(ptr)) };
+            let mut cx = Context::from_waker(&waker);
+            let poll = unsafe {
+                let fut = Pin::new_unchecked(&mut **task().future.get());
+                fut.poll(&mut cx)
+            };
+
+            if let Poll::Ready(_status) = poll {
+                task().completed.store(1, Ordering::Release);
+                unsafe { ManuallyDrop::drop(&mut *task().future.get()) };
+                break;
+            }
+
+            // Completed tasks stay "running"; wakers only set a flag.
+            if !task().poll_state.end_run(false) {
+                break;
+            }
+            // Woken during the poll: hand off to a fresh work item. If none can
+            // be allocated, keep polling here rather than dropping the wake.
+            if unsafe { Self::queue_work_item(ptr) } == STATUS_SUCCESS {
+                break;
+            }
+            task().poll_state.begin_run();
         }
 
         if !work_item.is_null() {
             unsafe { IoFreeWorkItem(work_item) };
         }
 
-        unsafe { tracker_complete(tracker) };
         unsafe { Self::release(ptr) };
     }
 
@@ -1557,6 +1560,7 @@ where
         }
         task.device = device;
         task.tracker = tracker as *const WorkItemTracker;
+        tracker.begin();
     }
     let status = unsafe { WorkItemTask::<F>::schedule(ptr) };
     unsafe { WorkItemTask::<F>::release(ptr) };
@@ -1654,6 +1658,7 @@ where
         }
         task.device = device;
         task.tracker = tracker as *const WorkItemTracker;
+        tracker.begin();
     }
 
     let handle = unsafe { WorkItemCancelHandle::new(ptr) };
@@ -1690,6 +1695,8 @@ where
 /// event is the completer's last access. The event is a notification event
 /// initialized once at the tracker's final address: dispatcher objects are
 /// self-referential and must not be moved after `KeInitializeEvent`.
+///
+/// Draining is final: track nothing new after calling `drain`.
 #[cfg(all(feature = "driver", feature = "async-com-kernel", not(miri)))]
 struct DrainTracker {
     count: DrainCount,
@@ -1727,9 +1734,10 @@ impl DrainTracker {
         self.event.get()
     }
 
+    /// May run at DISPATCH_LEVEL, so it must not wait on the event's one-time
+    /// initialization; that happens in `drain`, before the count can reach 0.
     #[inline]
     fn begin(&self) {
-        let _ = self.event();
         self.count.begin();
     }
 
@@ -1756,6 +1764,9 @@ impl DrainTracker {
                 0,
                 core::ptr::null_mut(),
             );
+            // The last completer may still be returning out of a DPC routine
+            // in this driver's image.
+            crate::ntddk::KeFlushQueuedDpcs();
         }
     }
 }
