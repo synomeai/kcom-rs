@@ -43,7 +43,7 @@ unsafe impl Sync for UNICODE_STRING {}
 #[cfg(all(feature = "async-com-kernel", driver_model__driver_type = "WDM", not(miri)))]
 pub use wdk_sys::ntddk::{
     DEVICE_OBJECT, IoAllocateWorkItem, IoFreeWorkItem, IoQueueWorkItem, ObDereferenceObject,
-    ObReferenceObject, PIO_WORKITEM, WORK_QUEUE_TYPE,
+    ObReferenceObject, PIO_WORKITEM, PIO_WORKITEM_ROUTINE, WORK_QUEUE_TYPE,
 };
 
 #[cfg(all(feature = "async-com-kernel", driver_model__driver_type = "KMDF", not(miri)))]

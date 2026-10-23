@@ -804,7 +804,7 @@ unsafe fn current_cpu_index() -> usize {
 #[inline]
 unsafe fn alloc_aligned(pool_type: u32, size: usize, tag: u32, align: usize) -> *mut u8 {
     if size == 0 {
-        return core::ptr::NonNull::<u8>::dangling().as_ptr();
+        return core::ptr::null_mut::<u8>().wrapping_add(align.max(1));
     }
 
     let total = match size

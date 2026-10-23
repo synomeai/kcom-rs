@@ -7,11 +7,11 @@
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use crate::allocator::{Allocator, PoolType, WdkAllocator};
-use crate::iunknown::{NTSTATUS, STATUS_SUCCESS};
+use crate::iunknown::{NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS};
+use crate::sync_state::LayoutSlots;
 use crate::wrapper::ComObject;
 
 use super::{AsyncOperationTask, AsyncOperationVtbl, AsyncValueType};
@@ -56,19 +56,23 @@ fn async_com_pool_tag() -> u32 {
     ASYNC_COM_POOL_TAG.load(Ordering::Acquire)
 }
 
-fn pool_state<T: AsyncValueType>() -> &'static AtomicU32 {
-    static STATE: AtomicU32 = AtomicU32::new(0);
-    &STATE
-}
+/// Number of distinct object layouts that get a lookaside list; further
+/// layouts fall back to the pool allocator.
+const POOL_SLOTS: usize = 16;
 
-fn pool_status<T: AsyncValueType>() -> &'static AtomicI32 {
-    static STATUS: AtomicI32 = AtomicI32::new(STATUS_SUCCESS);
-    &STATUS
-}
+// A `static` inside a generic function is a single instance shared by every
+// monomorphization, so per-type storage would hand one list (sized for the
+// first `T`) to every `T`. Lists are keyed by the object layout instead.
+static POOL_KEYS: LayoutSlots<POOL_SLOTS> = LayoutSlots::new();
+static POOL_STATE: [AtomicU32; POOL_SLOTS] = [const { AtomicU32::new(0) }; POOL_SLOTS];
+static POOL_STATUS: [AtomicI32; POOL_SLOTS] = [const { AtomicI32::new(STATUS_SUCCESS) }; POOL_SLOTS];
+static mut POOL_LISTS: [MaybeUninit<LOOKASIDE_LIST_EX>; POOL_SLOTS] =
+    [const { MaybeUninit::uninit() }; POOL_SLOTS];
 
-unsafe fn pool_storage<T: AsyncValueType>() -> *mut LOOKASIDE_LIST_EX {
-    static mut LIST: MaybeUninit<LOOKASIDE_LIST_EX> = MaybeUninit::uninit();
-    core::ptr::addr_of_mut!(LIST) as *mut LOOKASIDE_LIST_EX
+#[inline]
+unsafe fn pool_storage(slot: usize) -> *mut LOOKASIDE_LIST_EX {
+    let lists = core::ptr::addr_of_mut!(POOL_LISTS) as *mut MaybeUninit<LOOKASIDE_LIST_EX>;
+    unsafe { lists.add(slot) as *mut LOOKASIDE_LIST_EX }
 }
 
 #[derive(Copy, Clone, Default)]
@@ -102,16 +106,21 @@ impl<T: AsyncValueType> AsyncComPool<T> {
     }
 
     #[inline]
-    fn is_ready() -> bool {
-        pool_state::<T>().load(Ordering::Acquire) == Self::STATE_READY
+    fn is_ready(slot: usize) -> bool {
+        POOL_STATE[slot].load(Ordering::Acquire) == Self::STATE_READY
     }
 
     fn init() -> NTSTATUS {
-        let state = pool_state::<T>();
+        let layout = Self::expected_layout();
+        let Some(slot) = POOL_KEYS.find_or_claim(layout) else {
+            // Out of slots: allocations use the fallback allocator.
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let state = &POOL_STATE[slot];
         loop {
             match state.load(Ordering::Acquire) {
                 Self::STATE_READY => return STATUS_SUCCESS,
-                Self::STATE_FAILED => return pool_status::<T>().load(Ordering::Acquire),
+                Self::STATE_FAILED => return POOL_STATUS[slot].load(Ordering::Acquire),
                 Self::STATE_INITING => {
                     core::hint::spin_loop();
                     continue;
@@ -132,8 +141,7 @@ impl<T: AsyncValueType> AsyncComPool<T> {
             }
         }
 
-        let layout = Self::expected_layout();
-        let lookaside = unsafe { pool_storage::<T>() };
+        let lookaside = unsafe { pool_storage(slot) };
         let status = unsafe {
             ExInitializeLookasideListEx(
                 lookaside,
@@ -147,7 +155,7 @@ impl<T: AsyncValueType> AsyncComPool<T> {
             )
         };
 
-        pool_status::<T>().store(status, Ordering::Release);
+        POOL_STATUS[slot].store(status, Ordering::Release);
         if status >= 0 {
             state.store(Self::STATE_READY, Ordering::Release);
         } else {
@@ -159,20 +167,23 @@ impl<T: AsyncValueType> AsyncComPool<T> {
     #[inline]
     unsafe fn alloc(layout: Layout) -> *mut u8 {
         if layout.size() == 0 {
-            return NonNull::<u8>::dangling().as_ptr();
+            // Aligned dangling pointer (NonNull::dangling() is only 1-aligned).
+            return core::ptr::null_mut::<u8>().wrapping_add(layout.align());
         }
 
-        let expected = Self::expected_layout();
-        if layout.size() != expected.size() || layout.align() != expected.align() {
-            return WdkAllocator::new(PoolType::NonPagedNx, async_com_pool_tag()).alloc(layout);
+        let fallback = WdkAllocator::new(PoolType::NonPagedNx, async_com_pool_tag());
+        if layout != Self::expected_layout() {
+            return unsafe { fallback.alloc(layout) };
         }
 
-        let status = Self::init();
-        if status < 0 {
-            return WdkAllocator::new(PoolType::NonPagedNx, async_com_pool_tag()).alloc(layout);
+        if Self::init() < 0 {
+            return unsafe { fallback.alloc(layout) };
         }
+        let Some(slot) = POOL_KEYS.find(layout) else {
+            return unsafe { fallback.alloc(layout) };
+        };
 
-        let lookaside = unsafe { pool_storage::<T>() };
+        let lookaside = unsafe { pool_storage(slot) };
         let ptr = unsafe { ExAllocateFromLookasideListEx(lookaside) };
         ptr as *mut u8
     }
@@ -183,16 +194,18 @@ impl<T: AsyncValueType> AsyncComPool<T> {
             return;
         }
 
-        let expected = Self::expected_layout();
-        if layout.size() != expected.size()
-            || layout.align() != expected.align()
-            || !Self::is_ready()
-        {
-            WdkAllocator::new(PoolType::NonPagedNx, async_com_pool_tag()).dealloc(ptr, layout);
+        let fallback = WdkAllocator::new(PoolType::NonPagedNx, async_com_pool_tag());
+        let slot = if layout == Self::expected_layout() {
+            POOL_KEYS.find(layout).filter(|&slot| Self::is_ready(slot))
+        } else {
+            None
+        };
+        let Some(slot) = slot else {
+            unsafe { fallback.dealloc(ptr, layout) };
             return;
-        }
+        };
 
-        let lookaside = unsafe { pool_storage::<T>() };
+        let lookaside = unsafe { pool_storage(slot) };
         unsafe { ExFreeToLookasideListEx(lookaside, ptr as PVOID) };
     }
 }
@@ -211,6 +224,9 @@ impl<T: AsyncValueType> Allocator for AsyncComAlloc<T> {
 
 /// Initialize the async COM lookaside pool for the given output type.
 ///
+/// Pools are keyed by object layout, so output types whose objects have the
+/// same layout share one lookaside list.
+///
 /// Call this at PASSIVE_LEVEL during driver initialization.
 #[inline]
 pub fn init_async_com_pool_for<T: AsyncValueType>() -> NTSTATUS {
@@ -220,11 +236,14 @@ pub fn init_async_com_pool_for<T: AsyncValueType>() -> NTSTATUS {
 /// Tear down the async COM lookaside pool for the given output type.
 ///
 /// # Safety
-/// Call this only after all async COM objects of this type are dropped.
+/// Call this only after all async COM objects that use this pool are dropped,
+/// including those of other output types with the same object layout.
 #[inline]
 pub unsafe fn shutdown_async_com_pool_for<T: AsyncValueType>() {
-    let state = pool_state::<T>();
-    if state
+    let Some(slot) = POOL_KEYS.find(AsyncComPool::<T>::expected_layout()) else {
+        return;
+    };
+    if POOL_STATE[slot]
         .compare_exchange(
             AsyncComPool::<T>::STATE_READY,
             AsyncComPool::<T>::STATE_UNINIT,
@@ -233,8 +252,8 @@ pub unsafe fn shutdown_async_com_pool_for<T: AsyncValueType>() {
         )
         .is_ok()
     {
-        let lookaside = unsafe { pool_storage::<T>() };
+        let lookaside = unsafe { pool_storage(slot) };
         unsafe { ExDeleteLookasideListEx(lookaside) };
-        pool_status::<T>().store(STATUS_SUCCESS, Ordering::Release);
+        POOL_STATUS[slot].store(STATUS_SUCCESS, Ordering::Release);
     }
 }
