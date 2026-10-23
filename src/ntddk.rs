@@ -48,39 +48,3 @@ pub use wdk_sys::ntddk::{
 };
 #[cfg(all(feature = "async-com-kernel", driver_model__driver_type = "WDM", not(miri)))]
 pub use wdk_sys::{DEVICE_OBJECT, PIO_WORKITEM, PIO_WORKITEM_ROUTINE, _IO_WORKITEM, _WORK_QUEUE_TYPE};
-
-#[cfg(all(feature = "async-com-kernel", driver_model__driver_type = "KMDF", not(miri)))]
-pub use wdk_sys::wdf::{
-    WDFOBJECT, WDFDEVICE, WDFWORKITEM, PFN_WDF_WORKITEM, WDF_WORKITEM_CONFIG,
-    WDF_OBJECT_ATTRIBUTES, WDF_OBJECT_CONTEXT_TYPE_INFO, WdfWorkItemCreate,
-    WdfWorkItemEnqueue, WdfObjectDelete, WdfObjectGetTypedContextWorker,
-};
-
-#[cfg(all(feature = "async-com-kernel", driver_model__driver_type = "KMDF", not(miri)))]
-#[inline]
-pub fn wdf_workitem_config_init(evt: PFN_WDF_WORKITEM) -> WDF_WORKITEM_CONFIG {
-    WDF_WORKITEM_CONFIG {
-        Size: core::mem::size_of::<WDF_WORKITEM_CONFIG>() as u32,
-        EvtWorkItem: evt,
-        AutomaticSerialization: 0,
-    }
-}
-
-#[cfg(all(feature = "async-com-kernel", driver_model__driver_type = "KMDF", not(miri)))]
-#[inline]
-pub fn wdf_object_attributes_init(
-    parent: WDFOBJECT,
-    context_size: usize,
-    context_type_info: *const WDF_OBJECT_CONTEXT_TYPE_INFO,
-) -> WDF_OBJECT_ATTRIBUTES {
-    WDF_OBJECT_ATTRIBUTES {
-        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as u32,
-        EvtCleanupCallback: None,
-        EvtDestroyCallback: None,
-        ExecutionLevel: 0,
-        SynchronizationScope: 0,
-        ParentObject: parent,
-        ContextSizeOverride: context_size,
-        ContextTypeInfo: context_type_info,
-    }
-}

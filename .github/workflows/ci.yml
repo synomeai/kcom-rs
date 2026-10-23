@@ -121,6 +121,11 @@ jobs:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           RUSTFLAGS: --cfg driver_model__driver_type="WDM"
         run: cargo check -p kcom --features driver,async-com-kernel
+      - name: Check kcom with the KMDF cfg
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          RUSTFLAGS: --cfg driver_model__driver_type="KMDF"
+        run: cargo check -p kcom --features driver,async-com-kernel
       - name: Upload generated wdk-sys bindings
         if: always()
         uses: actions/upload-artifact@v4
