@@ -500,7 +500,8 @@ where
     }
 }
 
-impl<T, F> ComImpl<AsyncOperationVtbl<T>> for AsyncOperationTask<T, F>
+// SAFETY: the vtable is built from the ComObject shims; no extra interfaces.
+unsafe impl<T, F> ComImpl<AsyncOperationVtbl<T>> for AsyncOperationTask<T, F>
 where
     T: AsyncValueType,
     F: Future<Output = T> + Send + 'static,

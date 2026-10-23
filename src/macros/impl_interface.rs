@@ -181,7 +181,9 @@ macro_rules! impl_com_interface {
         $fallback:ty
     ) => {
         $crate::paste::paste! {
-            impl $crate::ComImpl<[<$trait_name Vtbl>]> for $ty {
+            // SAFETY: VTABLE is built from the generated shims for `Self`, and
+            // query_interface only returns `this` or this object's secondary entries.
+            unsafe impl $crate::ComImpl<[<$trait_name Vtbl>]> for $ty {
                 const VTABLE: &'static [<$trait_name Vtbl>] =
                     &[<$trait_name Vtbl>]::new::<Self>();
 
@@ -212,7 +214,9 @@ macro_rules! impl_com_interface {
         $fallback:ty
     ) => {
         $crate::paste::paste! {
-            impl $crate::ComImpl<[<$trait_name Vtbl>]> for $ty {
+            // SAFETY: VTABLE is built from the generated shims for `Self`, and
+            // query_interface only returns `this` or this object's secondary entries.
+            unsafe impl $crate::ComImpl<[<$trait_name Vtbl>]> for $ty {
                 const VTABLE: &'static [<$trait_name Vtbl>] =
                     &[<$trait_name Vtbl>]::new_primary::<Self, [<$trait_name Vtbl>], $crate::__kcom_vtbl_tuple!(($($sec),+)), $alloc>();
 
@@ -321,7 +325,9 @@ macro_rules! impl_com_interface_multiple {
         $fallback:ty
     ) => {
         $crate::paste::paste! {
-            impl $crate::ComImpl<[<$trait_name Vtbl>]> for $ty {
+            // SAFETY: VTABLE is built from the generated shims for `Self`, and
+            // query_interface only returns `this` or this object's secondary entries.
+            unsafe impl $crate::ComImpl<[<$trait_name Vtbl>]> for $ty {
                 const VTABLE: &'static [<$trait_name Vtbl>] =
                     &[<$trait_name Vtbl>]::new_secondary::<Self, [<$primary Vtbl>], $crate::__kcom_vtbl_tuple!(($($sec),+)), $alloc, { $index }>();
 
