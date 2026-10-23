@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -50,6 +51,110 @@ jobs:
         features:
           - ""
           - "async-impl,kernel-unicode"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri setup
+      - name: kcom unit tests
+        run: cargo miri test -p kcom --lib --features "${{ matrix.features }}"
+      - name: kcom-tests
+        run: cargo miri test -p kcom-tests --tests --features "${{ matrix.features }}"
+
+  windows-host-tests:
+    name: Windows host tests (${{ matrix.features || 'default' }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "async-impl,kernel-unicode"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: kcom unit tests
+        run: cargo test -p kcom --lib --features "${{ matrix.features }}"
+      - name: kcom-tests
+        run: cargo test -p kcom-tests --features "${{ matrix.features }}"
+
+  # Builds the kernel code against the real WDK. Nothing is loaded into a
+  # kernel: GitHub-hosted runners cannot install test-signed drivers.
+  windows-wdk:
+    name: WDK build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Show installed Windows Kits and LLVM
+        shell: pwsh
+        run: |
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue | Format-List
+          Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -ErrorAction SilentlyContinue |
+            ForEach-Object { "$($_.Name) km=$(Test-Path (Join-Path $_.FullName 'km'))" }
+          Get-ChildItem 'C:\Program Files\LLVM\bin\libclang.dll' -ErrorAction SilentlyContinue
+      - name: Check kcom driver feature sets
+        shell: pwsh
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sets = @(
+            "driver",
+            "driver,async-com-kernel",
+            "driver,async-com-kernel,async-com-metrics",
+            "driver,async-com-fused",
+            "driver,wdk-alloc-align",
+            "driver,kernel-unicode,refcount-hardening"
+          )
+          foreach ($set in $sets) {
+            Write-Host "==> cargo check -p kcom --features $set"
+            cargo check -p kcom --features $set
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Check kcom WDM-only code
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          RUSTFLAGS: --cfg driver_model__driver_type="WDM"
+        run: cargo check -p kcom --features driver,async-com-kernel
+      - name: Upload generated wdk-sys bindings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdk-sys-bindings
+          path: target/debug/build/wdk-sys-*/out/*.rs
+          if-no-files-found: warn
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build test drivers
+        # The test drivers use #![feature(alloc_error_handler)].
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: cargo +nightly build --release -p driver-test -p driver-test-fused
+      - name: Upload test drivers
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-drivers
+          path: |
+            target/release/driver_test.dll
+            target/release/driver_test_fused.dll
+            target/release/*.pdb
+          if-no-files-found: warn
+
+  windows-wdk-miri:
+    name: WDK Miri (${{ matrix.features }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "driver async-com-kernel driver-test-stub"
+          - "driver wdk-alloc-align driver-test-stub"
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
