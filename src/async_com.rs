@@ -1,6 +1,6 @@
 // async_com.rs
 //
-// Copyright (c) 2026 Exveria
+// Copyright (c) 2026 Synome
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core::cell::UnsafeCell;
