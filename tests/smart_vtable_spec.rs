@@ -1,6 +1,6 @@
 // tests/smart_vtable_spec.rs
 //
-// Copyright (c) 2026 Exveria
+// Copyright (c) 2026 Synome
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Smart VTable & COM Runtime Specification Tests
